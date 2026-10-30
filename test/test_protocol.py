@@ -126,7 +126,7 @@ class ProtocolTests(unittest.TestCase):
             conn.sendall(frame(3, bytes(range(256))))
         self.assertNotEqual(self.run_peer(peer).returncode, 0)
 
-    def test_ack_failure_does_not_count_delivery(self):
+    def test_nonempty_server_ack_is_rejected(self):
         # Invalid server ACK shape is a protocol failure, not an ignored frame.
         def peer(conn):
             handshake(conn)

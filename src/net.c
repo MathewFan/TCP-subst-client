@@ -100,6 +100,8 @@ int dial_tcp(const char *host, const char *port) {
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &saved, &length) == 0 &&
             saved == 0)
           rc = 0;
+        else if (saved)
+          errno = saved;
       }
     }
     if (rc == 0)
