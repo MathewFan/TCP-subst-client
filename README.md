@@ -30,7 +30,7 @@ Every frame is a 12-byte big-endian header: magic `0x53554253` (u32), version `1
 
 `SUBST_TIMEOUT_MS` defaults to 5000 (allowed 10–600000). One monotonic deadline covers an entire network frame, so a peer cannot reset its budget by dripping bytes. Connect attempts share a deadline after DNS resolution. DNS resolution and writes to a blocking stdout destination are not covered by that network deadline. An ACK means stdout accepted bytes, not that a downstream file was fsynced. On later failure, earlier stdout bytes may already exist: consumers should check exit status before publishing output.
 
-`SUBST_STATS=1` emits frames, plaintext bytes and ACK counts to stderr, preserving binary-clean stdout. Counters advance after successful output and ACK; diagnostics do not include secrets.
+`SUBST_STATS=1` emits frames, plaintext bytes and ACK counts to stderr, preserving binary-clean stdout. `frames` counts parsed incoming frames, including control frames. Plaintext byte and ACK counters advance only after successful output and ACK; diagnostics do not include secrets. Empty server ACK frames are tolerated during streaming.
 
 ## Verification
 
