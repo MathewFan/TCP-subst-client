@@ -1,85 +1,101 @@
 #define _POSIX_C_SOURCE 200809L
 #include "common.h"
+#include <errno.h>
+#include <limits.h>
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-/* hex-encode helper */
-static void to_hex(const uint8_t *in, size_t n, char *out_hex) {
-  static const char *d = "0123456789abcdef";
-  for (size_t i = 0; i < n; i++) {
-    out_hex[2*i]   = d[(in[i] >> 4) & 0xF];
-    out_hex[2*i+1] = d[in[i] & 0xF];
+static int authenticate(int fd, const char *username, const char *secret,
+                        const uint8_t *salt, size_t length) {
+  size_t user_length = strlen(username), key_length = strlen(secret),
+         size = user_length + length + key_length + 2;
+  if (!user_length || user_length > 255 || !key_length || key_length > 4096) {
+    errno = EINVAL;
+    return -1;
   }
-  out_hex[2*n] = '\0';
+  uint8_t *message = malloc(size);
+  if (!message)
+    return -1;
+  memcpy(message, username, user_length);
+  message[user_length] = '|';
+  memcpy(message + user_length + 1, salt, length);
+  message[user_length + 1 + length] = '|';
+  memcpy(message + user_length + length + 2, secret, key_length);
+  uint8_t mac[EVP_MAX_MD_SIZE];
+  unsigned int mac_length = 0;
+  unsigned char *ok = HMAC(EVP_sha256(), secret, (int)key_length, message, size,
+                           mac, &mac_length);
+  OPENSSL_cleanse(message, size);
+  free(message);
+  if (!ok || mac_length != 32)
+    return -1;
+  static const char digits[] = "0123456789abcdef";
+  uint8_t hex[64];
+  for (size_t i = 0; i < 32; i++) {
+    hex[2 * i] = digits[mac[i] >> 4];
+    hex[2 * i + 1] = digits[mac[i] & 15];
+  }
+  int result = write_frame(fd, AUTH_RESPONSE, hex, sizeof(hex));
+  OPENSSL_cleanse(mac, sizeof(mac));
+  OPENSSL_cleanse(hex, sizeof(hex));
+  return result;
 }
-
-int handle_session(int fd, const char *username, const char *secret) {
-  uint8_t subst_map[256] = {0};
-  int have_map = 0;
-
-  while (1) {
-    struct MsgHeader h; uint8_t *body = NULL;
-    if (read_frame(fd, &h, &body) != 0) return 0;
-
-    switch (h.type) {
-      case AUTH_CHALLENGE: {
-        /* body = salt string */
-        const char *salt = (const char*)body;
-        size_t payload_len = h.length;
-
-        /* Build message username|salt|secret */
-        size_t ulen = strlen(username), slen = payload_len, klen = strlen(secret);
-        size_t msg_len = ulen + 1 + slen + 1 + klen;
-        char *msg = malloc(msg_len + 1);
-        if (!msg) { free(body); return -1; }
-        snprintf(msg, msg_len + 1, "%s|%.*s|%s", username, (int)slen, salt, secret);
-
-        unsigned int outlen = 0;
-        unsigned char mac[EVP_MAX_MD_SIZE];
-        HMAC(EVP_sha256(), secret, (int)klen, (unsigned char*)msg, (int)strlen(msg), mac, &outlen);
-
-        char hex[2*EVP_MAX_MD_SIZE + 1];
-        to_hex(mac, outlen, hex);
-
-        if (write_frame(fd, AUTH_RESPONSE, (uint8_t*)hex, (uint32_t)strlen(hex)) != 0) {
-          free(msg); free(body); return -1;
+int handle_session_ex(int fd, const char *username, const char *secret,
+                      struct SessionStats *stats) {
+  enum { CHALLENGE, MAP, STREAM } state = CHALLENGE;
+  uint8_t map[256];
+  for (;;) {
+    struct MsgHeader header;
+    uint8_t *body = NULL;
+    int rc = read_frame(fd, &header, &body);
+    if (rc == 1) {
+      if (state == STREAM)
+        return 0;
+      errno = EPROTO;
+      return -1;
+    }
+    if (rc < 0)
+      return -1;
+    if (stats)
+      stats->frames++;
+    if (state == CHALLENGE && header.type == AUTH_CHALLENGE) {
+      rc = authenticate(fd, username, secret, body, header.length);
+      if (!rc)
+        state = MAP;
+    } else if (state == MAP && header.type == CIPHER_MAP) {
+      uint8_t seen[256] = {0};
+      rc = 0;
+      for (size_t i = 0; i < 256; i++)
+        if (seen[body[i]]++) {
+          rc = -1;
+          break;
         }
-        free(msg); free(body);
-        break;
+      if (!rc) {
+        memcpy(map, body, 256);
+        state = STREAM;
       }
-      case CIPHER_MAP: {
-        if (h.length != 256) { free(body); return -1; }
-        memcpy(subst_map, body, 256);
-        have_map = 1;
-        free(body);
-        break;
+    } else if (state == STREAM && header.type == CIPHERTEXT) {
+      apply_subst(map, body, header.length, body);
+      rc = write_full(STDOUT_FILENO, body, header.length);
+      if (!rc)
+        rc = write_frame(fd, ACK, NULL, 0);
+      if (!rc && stats) {
+        stats->plaintext_bytes += header.length;
+        stats->acks++;
       }
-      case CIPHERTEXT: {
-        if (!have_map) { free(body); return -1; }
-        uint8_t *plain = malloc(h.length);
-        if (!plain) { free(body); return -1; }
-        apply_subst(subst_map, body, h.length, plain);
-
-        /* Print plaintext to stdout (binary-safe write) */
-        if (write_full(STDOUT_FILENO, plain, h.length) != 0) {
-          free(plain); free(body); return -1;
-        }
-        /* Acknowledge */
-        (void)write_frame(fd, ACK, NULL, 0);
-
-        free(plain); free(body);
-        break;
-      }
-      case ACK:
-        /* Ignore (server acks us) */
-        free(body);
-        break;
-      default:
-        free(body);
-        return -1;
+    } else if (state == STREAM && header.type == ACK && header.length == 0)
+      rc = 0;
+    else
+      rc = -1;
+    free(body);
+    if (rc) {
+      errno = EPROTO;
+      return -1;
     }
   }
+}
+int handle_session(int fd, const char *username, const char *secret) {
+  return handle_session_ex(fd, username, secret, NULL);
 }
